@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SOC Performance - Color Coded Report</title>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root { --primary: #1a73e8; --success: #28a745; --danger: #d93025; --dark: #202124; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f4f7f9; padding: 20px; color: var(--dark); }
+        .container { max-width: 1300px; margin: auto; background: white; padding: 35px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 25px; }
+        .btn-export { padding: 12px 28px; background: var(--success); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        .btn-export:disabled { background: #ccc; cursor: not-allowed; }
+
+        #drop-zone { border: 2px dashed var(--primary); padding: 50px; text-align: center; background: #f8fbff; border-radius: 12px; cursor: pointer; margin-bottom: 25px; }
+        
+        /* Stats & Charts */
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 30px; display: none; }
+        .stat-card { background: #fff; border: 1px solid #ddd; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-card h3 { margin: 0; font-size: 13px; color: #666; text-transform: uppercase; }
+        .stat-card p { margin: 10px 0 0; font-size: 26px; font-weight: bold; color: var(--primary); }
+
+        .chart-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 30px; display: none; }
+        .chart-box { background: white; padding: 20px; border: 1px solid #e0e0e0; border-radius: 12px; height: 380px; }
+
+        /* Loader */
+        #loader { display: none; text-align: center; padding: 30px; }
+        .spinner { width: 45px; height: 45px; border: 5px solid #f3f3f3; border-top: 5px solid var(--primary); border-radius: 50%; animation: spin 1s linear infinite; margin: auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Table with color markers */
+        .table-container { overflow-x: auto; max-height: 500px; border: 1px solid #eee; border-radius: 8px; margin-top: 20px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { background: #f8f9fa; padding: 15px; text-align: left; border-bottom: 2px solid #ddd; position: sticky; top: 0; }
+        td { padding: 12px; border-bottom: 1px solid #eee; }
+        .color-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="header">
+        <div>
+            <h1>SOC Master Consolidation Report</h1>
+            <p style="margin:5px 0 0; color:#666;">Unique Color Coding per Event Name Enabled</p>
+        </div>
+        <button id="exportBtn" class="btn-export" onclick="exportData()" disabled>EXPORT TO EXCEL</button>
+    </div>
+
+    <div id="drop-zone" onclick="document.getElementById('fileInput').click()">
+        <strong>Click or Drag Multiple Files (4+ Sheets Supported)</strong>
+        <p>Grouping by Alert Name and Summing Counts with unique colors.</p>
+        <input type="file" id="fileInput" accept=".xlsx, .xls" multiple style="display:none" />
+    </div>
+
+    <div id="loader">
+        <div class="spinner"></div>
+        <p style="margin-top:15px; font-weight:600;">Applying Color Rules and Processing...</p>
+    </div>
+
+    <div class="stats-grid" id="statsArea">
+        <div class="stat-card"><h3>Total Events</h3><p id="s-total">0</p></div>
+        <div class="stat-card"><h3>Unique Alerts</h3><p id="s-unique">0</p></div>
+        <div class="stat-card"><h3>True Positives</h3><p id="s-tp" style="color:var(--success)">0</p></div>
+        <div class="stat-card"><h3>False Positives</h3><p id="s-fp" style="color:var(--danger)">0</p></div>
+    </div>
+
+    <div class="chart-grid" id="chartArea">
+        <div class="chart-box"><canvas id="barChart"></canvas></div>
+        <div class="chart-box"><canvas id="pieChart"></canvas></div>
+    </div>
+
+    <div class="table-container">
+        <table id="mainTable">
+            <thead><tr id="thr"></tr></thead>
+            <tbody id="tbr"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    let consolidatedData = [], headers = [], charts = {}, colorMap = {};
+    const TARGET_COLS = ["Event Name", "Event Severity Category", "Fine-tune Status", "Incident Resolution", "Count"];
+
+    // Helper to generate unique colors
+    function getEventColor(name) {
+        if (colorMap[name]) return colorMap[name];
+        const colors = [
+            '#1a73e8', '#d93025', '#f9ab00', '#188038', '#af5cf7', 
+            '#00acc1', '#ff7043', '#9e9e9e', '#f06292', '#5c6bc0'
+        ];
+        const index = Object.keys(colorMap).length % colors.length;
+        colorMap[name] = colors[index];
+        return colors[index];
+    }
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files);
+        if (!files.length) return;
+
+        document.getElementById('loader').style.display = 'block';
+        document.getElementById('drop-zone').style.display = 'none';
+
+        const map = new Map();
+        colorMap = {}; // Reset colors for new upload
+        
+        for (const file of files) {
+            const buffer = await file.arrayBuffer();
+            const workbook = XLSX.read(buffer, { type: 'array' });
+            
+            workbook.SheetNames.forEach(sheetName => {
+                const sheet = workbook.Sheets[sheetName];
+                const data = XLSX.utils.sheet_to_json(sheet);
+
+                if (data.length > 0) {
+                    data.forEach(row => {
+                        const alertName = row["Event Name"] || row["Alert Name"] || "Unknown";
+                        const count = parseInt(row["Count"]) || 0;
+
+                        if (map.has(alertName)) {
+                            map.get(alertName)["Count"] += count;
+                        } else {
+                            map.set(alertName, {
+                                "Event Name": alertName,
+                                "Event Severity Category": row["Event Severity Category"] || "N/A",
+                                "Fine-tune Status": row["Fine-tune Status"] || "N/A",
+                                "Incident Resolution": row["Incident Resolution"] || "N/A",
+                                "Count": count,
+                                "Color": getEventColor(alertName)
+                            });
+                        }
+                    });
+                }
+            });
+        }
+
+        consolidatedData = Array.from(map.values());
+        headers = TARGET_COLS;
+        processUI();
+    });
+
+    function processUI() {
+        document.getElementById('loader').style.display = 'none';
+        document.getElementById('statsArea').style.display = 'grid';
+        document.getElementById('chartArea').style.display = 'grid';
+        document.getElementById('exportBtn').disabled = false;
+
+        const totalHits = consolidatedData.reduce((s, r) => s + r.Count, 0);
+        const totalTP = consolidatedData.reduce((s, r) => s + (String(r["Incident Resolution"]).toLowerCase().includes("true") ? r.Count : 0), 0);
+        const totalFP = consolidatedData.reduce((s, r) => s + (String(r["Incident Resolution"]).toLowerCase().includes("false") ? r.Count : 0), 0);
+
+        document.getElementById('s-total').innerText = totalHits;
+        document.getElementById('s-unique').innerText = consolidatedData.length;
+        document.getElementById('s-tp').innerText = totalTP;
+        document.getElementById('s-fp').innerText = totalFP;
+
+        renderTable();
+        renderCharts(totalTP, totalFP);
+    }
+
+    function renderTable() {
+        document.getElementById('thr').innerHTML = headers.map(h => `<th>${h}</th>`).join('');
+        document.getElementById('tbr').innerHTML = consolidatedData.map(row => 
+            `<tr>
+                <td><span class="color-dot" style="background:${row.Color}"></span>${row["Event Name"]}</td>
+                <td>${row["Event Severity Category"]}</td>
+                <td>${row["Fine-tune Status"]}</td>
+                <td>${row["Incident Resolution"]}</td>
+                <td>${row["Count"]}</td>
+            </tr>`
+        ).join('');
+    }
+
+    function renderCharts(tp, fp) {
+        const sortedData = [...consolidatedData].sort((a,b) => b.Count - a.Count).slice(0, 10);
+        
+        if (charts.bar) charts.bar.destroy();
+        charts.bar = new Chart(document.getElementById('barChart'), {
+            type: 'bar',
+            data: {
+                labels: sortedData.map(r => r["Event Name"]),
+                datasets: [{ 
+                    label: 'Alert Count', 
+                    data: sortedData.map(r => r.Count), 
+                    backgroundColor: sortedData.map(r => r.Color) 
+                }]
+            },
+            options: { 
+                responsive: true, maintainAspectRatio: false,
+                plugins: { title: { display: true, text: 'Top 10 Alerts by Count' } }
+            }
+        });
+
+        if (charts.pie) charts.pie.destroy();
+        charts.pie = new Chart(document.getElementById('pieChart'), {
+            type: 'doughnut',
+            data: {
+                labels: ['True Positives', 'False Positives'],
+                datasets: [{ data: [tp, fp], backgroundColor: ['#28a745', '#d93025'] }]
+            },
+            options: { responsive: true, maintainAspectRatio: false }
+        });
+    }
+
+    function exportData() {
+        // Export only requested columns
+        const exportSubset = consolidatedData.map(r => {
+            let n = {};
+            TARGET_COLS.forEach(h => n[h] = r[h]);
+            return n;
+        });
+        const ws = XLSX.utils.json_to_sheet(exportSubset);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Consolidated_Report");
+        XLSX.writeFile(wb, "SOC_Colored_Final_Report.xlsx");
+    }
+</script>
+</body>
+</html>
